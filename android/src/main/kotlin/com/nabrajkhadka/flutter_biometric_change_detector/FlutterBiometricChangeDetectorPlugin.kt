@@ -7,6 +7,8 @@
 package com.nabrajkhadka.flutter_biometric_change_detector
 
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyPermanentlyInvalidatedException
 
@@ -22,6 +24,7 @@ import io.flutter.plugin.common.MethodChannel.Result
 import java.security.InvalidKeyException
 import java.security.Key
 import java.security.KeyStore
+import java.util.concurrent.Executors
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -36,6 +39,8 @@ class FlutterBiometricChangeDetectorPlugin: FlutterPlugin, MethodCallHandler {
   private var keyStore: KeyStore? = null
   private val KEY_NAME = "BIOMETRIC_CHANGE"
   private var biometricPrompt: BiometricPrompt? = null
+  private val executor = Executors.newSingleThreadExecutor()
+  private val mainHandler = Handler(Looper.getMainLooper())
 
 
   override fun onAttachedToEngine(@NonNull flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
@@ -57,52 +62,40 @@ class FlutterBiometricChangeDetectorPlugin: FlutterPlugin, MethodCallHandler {
   }
 
   @RequiresApi(Build.VERSION_CODES.N)
-  private fun checkBiometricChange( result: Result) {
-    try {
-      val cipher: Cipher = getCipher()
-      val secretKey: SecretKey? = getSecretKey()
-      if (secretKey == null) {
-        result.error("biometricNotAvailable",
-          "Biometric authentication is not available or no biometric is enrolled",
-          "No secret key could be created")
-        return
-      }
+  private fun checkBiometricChange(result: Result) {
+    // Run crypto operations on background thread to prevent ANR
+    executor.execute {
       try {
-        cipher.init(Cipher.ENCRYPT_MODE, secretKey)
-        result.success("biometricValid")
-      } catch (e: KeyPermanentlyInvalidatedException) {
-        result.error("biometricChanged",
-          "Yes your hand has been changed, please login to activate again",e.toString())
-      } catch (e: InvalidKeyException) {
-        e.printStackTrace() //todo: print only in debug mode
-        result.error("biometricInvalid","Invalid biometric",e.toString())
-      }
-      //Title require
-      val promptInfo = BiometricPrompt.PromptInfo.Builder()
-        .setTitle("Biometric")
-        .setDescription("Check Biometric")
-        .setNegativeButtonText("OK")
-        .build()
-      try {
-        cipher.init(Cipher.ENCRYPT_MODE, secretKey)
-        biometricPrompt?.authenticate(promptInfo, BiometricPrompt.CryptoObject(cipher))
-      } catch (e: KeyPermanentlyInvalidatedException) {
-        keyStore?.deleteEntry(KEY_NAME)
-        if (getCurrentKey(KEY_NAME) == null) {
-          val builder = KeyGenParameterSpec.Builder(KEY_NAME,
-            KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
-            .setBlockModes(KeyProperties.BLOCK_MODE_CBC)
-            .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_PKCS7)
-            .setUserAuthenticationRequired(true) // Invalidate the keys if the user has registered a new biometric
-          if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
-            builder.setInvalidatedByBiometricEnrollment(true)
+        val cipher: Cipher = getCipher()
+        val secretKey: SecretKey? = getSecretKey()
+        if (secretKey == null) {
+          mainHandler.post {
+            result.error("biometricNotAvailable",
+              "Biometric authentication is not available or no biometric is enrolled",
+              "No secret key could be created")
           }
-          generateSecretKey(builder.build())
+          return@execute
+        }
+        try {
+          cipher.init(Cipher.ENCRYPT_MODE, secretKey)
+          mainHandler.post { result.success("biometricValid") }
+        } catch (e: KeyPermanentlyInvalidatedException) {
+          mainHandler.post {
+            result.error("biometricChanged",
+              "Yes your hand has been changed, please login to activate again", e.toString())
+          }
+        } catch (e: InvalidKeyException) {
+          e.printStackTrace() //todo: print only in debug mode
+          mainHandler.post {
+            result.error("biometricInvalid", "Invalid biometric", e.toString())
+          }
+        }
+      } catch (e: Exception) {
+        e.printStackTrace()
+        mainHandler.post {
+          result.error("biometricError", "Error checking biometric", e.toString())
         }
       }
-    } catch (e: Exception) {
-      e.printStackTrace()
-      result.error("biometricError", "Error checking biometric", e.toString())
     }
   }
   fun getCurrentKey(keyName: String): Key? {
